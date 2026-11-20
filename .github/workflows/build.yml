@@ -1,0 +1,124 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Locate project
+        shell: bash
+        run: |
+          shopt -s nullglob
+          zips=( *.zip )
+          if [ ${#zips[@]} -gt 0 ]; then
+            for z in "${zips[@]}"; do
+              echo "Unzipping $z ..."
+              unzip -qo "$z"
+            done
+          fi
+
+          S=$(find . -name settings.gradle -o -name settings.gradle.kts | grep -v '/.git/' | head -n1)
+          if [ -z "$S" ]; then
+            echo "::error::لم أجد ملف settings.gradle داخل المشروع."
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$S")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project found at: $PROJECT_DIR"
+          ls -la "$PROJECT_DIR"
+
+      - name: Prepare google-services.json
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        env:
+          GS_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          for m in clinic lab; do
+            if [ ! -d "$m" ]; then
+              echo "::error::المجلد $m غير موجود داخل المشروع ($PWD)."
+              exit 1
+            fi
+            if [ -n "$GS_JSON" ]; then
+              printf '%s\n' "$GS_JSON" > "$m/google-services.json"
+            fi
+            if [ ! -s "$m/google-services.json" ]; then
+              echo "::error::الملف $m/google-services.json غير موجود أو فارغ. أضفه للمستودع أو أنشئ Secret باسم GOOGLE_SERVICES_JSON."
+              exit 1
+            fi
+            python3 -c "import json; json.load(open('$m/google-services.json'))" \
+              || { echo "::error::$m/google-services.json ليس JSON صالحاً"; exit 1; }
+          done
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Make gradlew executable
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ -f ./gradlew ]; then chmod +x ./gradlew; fi
+
+      - name: Build both apps (clinic + lab)
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ -x ./gradlew ]; then
+            ./gradlew :clinic:assembleDebug :lab:assembleDebug --no-daemon --stacktrace
+          else
+            gradle :clinic:assembleDebug :lab:assembleDebug --no-daemon --stacktrace
+          fi
+
+      - name: Collect APKs
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "${{ env.PROJECT_DIR }}/clinic/build/outputs/apk/debug/clinic-debug.apk" \
+             "dist/DentalLab-Clinics.apk"
+          cp "${{ env.PROJECT_DIR }}/lab/build/outputs/apk/debug/lab-debug.apk" \
+             "dist/DentalLab-Lab.apk"
+          ls -la dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: DentalLab-APKs
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: APK build ${{ github.run_number }}
+          body: |
+            ملفا التثبيت:
+            - **DentalLab-Clinics.apk** — تطبيق العيادات
+            - **DentalLab-Lab.apk** — تطبيق المعمل
+          files: dist/*.apk
+          draft: false
+          prerelease: false
+          make_latest: 'false'
